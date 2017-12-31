@@ -1,0 +1,571 @@
+---
+title: "BTYD"
+author: "Tianyi Wang"
+date: "2017Äê12ÔÂ26ÈÕ"
+output: html_document
+---
+
+```{r}
+library(BTYD)
+cdnowElog <- system.file("data/cdnowElog.csv", package = "BTYD")
+data1=read.csv(cdnowElog)
+head(data1)
+```
+
+```{r}
+elog=data1[,c(2,3,5)]
+names(elog)[1]="cust"
+head(elog)
+```
+
+```{r}
+formatdata=function(x){
+  y=paste(substr(x,1,4),substr(x,5,6),substr(x,7,8),sep="-")
+  return(as.Date(y))
+}
+elog$date=formatdata(elog$date)
+elog[1:3,]
+```
+
+##Merge Transactions On Same Day
+
+```{r}
+dc.WriteLine <- function(...) {
+    message(...)
+    flush.console()
+}
+dc.MergeTransactionsOnSameDate <- function(elog) {
+    dc.WriteLine("Started merging same-date transactions...")
+    elog <- cbind(elog, 1:nrow(elog) * (!duplicated(elog[, c("cust", "date")])))
+    aggr.elog <- aggregate(elog[, !(colnames(elog) %in% c("cust", "date"))], by = list(cust = elog[, 
+        "cust"], date = elog[, "date"]), sum)
+    aggr.elog <- aggr.elog[order(aggr.elog[, ncol(aggr.elog)]), ][, -ncol(aggr.elog)]
+    dc.WriteLine("... Finished merging same-date transactions.")
+    return(aggr.elog)
+}
+elog <- dc.MergeTransactionsOnSameDate(elog)
+```
+
+To validate that the model works, we need to divide the data up into a calibration period and a holdout period. I am going to use 30 September 1997 as the cutoff date, as this point (39 weeks)
+divides the dataset in half.
+
+```{r}
+elog=data.frame(elog)
+end.of.cal.period <- as.Date("1997-09-30")
+elog.cal <- elog[which(elog$date <= end.of.cal.period), ]
+```
+
+We have to keep track of a ¡°time zero¡± as a point of reference for recency and total time observed. For this reason, we use dc.SplitUpElogForRepeatTrans, which returns a filtered event
+log ($repeat.trans.elog) as well as saving important information about each customer ($cust.data)
+
+```{r}
+dc.SplitUpElogForRepeatTrans <- function(elog) {
+    dc.WriteLine("Started Creating Repeat Purchases")
+    unique.custs <- unique(elog$cust)
+    first.trans.indices <- rep(0, length(unique.custs))
+    last.trans.indices <- rep(0, length(unique.custs))
+    count <- 0
+    for (cust in unique.custs) {
+        count <- count + 1
+        cust.indices <- which(elog$cust == cust)
+        # Of this customer's transactions, find the index of the first one
+        first.trans.indices[count] <- min(cust.indices[which(elog$date[cust.indices] == 
+            min(elog$date[cust.indices]))])
+        
+        # Of this customer's transactions, find the index of the last one
+        last.trans.indices[count] <- min(cust.indices[which(elog$date[cust.indices] == 
+            max(elog$date[cust.indices]))])
+    }
+    repeat.trans.elog <- elog[-first.trans.indices, ]
+    
+    first.trans.data <- elog[first.trans.indices, ]
+    last.trans.data <- elog[last.trans.indices, ]
+    
+    
+    # [-1] is because we don't want to change the column name for custs
+    names(first.trans.data)[-1] <- paste("first.", names(first.trans.data)[-1], sep = "")
+    names(first.trans.data)[which(names(first.trans.data) == "first.date")] <- "birth.per"
+    names(last.trans.data) <- paste("last.", names(last.trans.data), sep = "")
+    
+    # [-1] is because we don't want to include two custs columns
+    cust.data <- data.frame(first.trans.data, last.trans.data[, -1])
+    names(cust.data) <- c(names(first.trans.data), names(last.trans.data)[-1])
+    
+    dc.WriteLine("Finished Creating Repeat Purchases")
+    return(list(repeat.trans.elog = repeat.trans.elog, cust.data = cust.data))
+}
+```
+
+```{r}
+split.data <- dc.SplitUpElogForRepeatTrans(elog.cal)
+clean.elog <- split.data$repeat.trans.elog
+```
+
+The next step is to create a customer-by-time matrix. 
+
+```{r}
+dc.CreateFreqCBT <- function(elog) {
+    # Factoring is so that when xtabs sorts customers, it does so in the original
+    # order It doesn't matter that they're factors; rownames are stored as characters
+    elog$cust <- factor(elog$cust, levels = unique(elog$cust))
+    xt <- xtabs(~cust + date, data = elog)
+    dc.WriteLine("...Completed Freq CBT")
+    return(xt)
+}
+```
+
+```{r}
+freq.cbt <- dc.CreateFreqCBT(clean.elog);
+freq.cbt[1:3,1:5]
+```
+
+```{r}
+dc.MergeCustomers <- function(data.correct, data.to.correct) {
+    
+    ## Initialize a new data frame
+    data.to.correct.new <- matrix(0, nrow = nrow(data.correct), ncol = ncol(data.to.correct))
+    # data.to.correct.new <- data.frame(data.to.correct.new.size)
+    orig.order <- 1:nrow(data.correct)
+    orig.order <- orig.order[order(rownames(data.correct))]
+    data.correct.ordered <- data.correct[order(rownames(data.correct)), ]
+    ## obscure code: handles boundary case when data.correct has one column and
+    ## coerces data.correct.ordered to be a vector
+    if (is.null(nrow(data.correct.ordered))) {
+        # data.correct.ordered <- data.frame(data.correct.ordered)
+        rownames(data.correct.ordered) <- rownames(data.correct)[order(rownames(data.correct))]
+        colnames(data.correct.ordered) <- colnames(data.correct)
+    }
+    
+    data.to.correct <- data.to.correct[order(rownames(data.to.correct)), ]
+    rownames(data.to.correct.new) <- rownames(data.correct.ordered)
+    colnames(data.to.correct.new) <- colnames(data.to.correct)
+    
+    ## Initialize the two iterators ii.correct, ii.to.correct
+    ii.correct <- 1
+    ii.to.correct <- 1
+    
+    ## Grab the data to hold the stopping conditions
+    max.correct.iterations <- nrow(data.correct.ordered)
+    max.to.correct.iterations <- nrow(data.to.correct)
+    
+    ## Grab the lists of customers from the data frames and convert them to optimize
+    ## the loop speed
+    cust.list.correct <- rownames(data.correct.ordered)
+    cust.list.to.correct <- rownames(data.to.correct)
+    
+    cust.correct.indices <- c()
+    cust.to.correct.indices <- c()
+    
+    
+    while (ii.correct <= max.correct.iterations & ii.to.correct <= max.to.correct.iterations) {
+        cur.cust.correct <- cust.list.correct[ii.correct]
+        cur.cust.to.correct <- cust.list.to.correct[ii.to.correct]
+        if (cur.cust.correct < cur.cust.to.correct) {
+            ii.correct <- ii.correct + 1
+        } else if (cur.cust.correct > cur.cust.to.correct) {
+            ii.to.correct <- ii.to.correct + 1
+        } else if (cur.cust.correct == cur.cust.to.correct) {
+            ## data.to.correct.new[ii.correct, ] = data.to.correct[ii.to.correct, ]
+            cust.correct.indices <- c(cust.correct.indices, ii.correct)
+            cust.to.correct.indices <- c(cust.to.correct.indices, ii.to.correct)
+            
+            ii.correct <- ii.correct + 1
+            ii.to.correct <- ii.to.correct + 1
+        } else {
+            stop("Array checking error in MergeCustomers")
+        }
+    }
+    data.to.correct.new[cust.correct.indices, ] <- data.to.correct
+    data.to.correct.new <- data.to.correct.new[order(orig.order), ]
+    return(data.to.correct.new)
+}
+```
+
+```{r}
+tot.cbt <- dc.CreateFreqCBT(elog)
+cal.cbt <- dc.MergeCustomers(tot.cbt, freq.cbt)
+```
+
+From the calibration period customer-by-time matrix (and a bit of additional information we saved earlier), we can finally create the customer-bysufficient-statistic matrix described earlier.
+
+```{r}
+dc.BuildCBSFromCBTAndDates <- function(cbt, dates, per, cbt.is.during.cal.period = TRUE) {
+    if (cbt.is.during.cal.period == TRUE) {
+        dc.WriteLine("Started making calibration period CBS...")
+        custs.first.dates <- dates[, 1]
+        custs.last.dates <- dates[, 2]
+        T.cal <- dates[, 3]
+        if (length(custs.first.dates) != length(custs.last.dates)) {
+            stop("Invalid dates (different lengths) in BuildCBSFromFreqCBTAndDates")
+        }
+        
+        f <- rowSums(cbt)
+        r <- as.numeric(difftime(custs.last.dates, custs.first.dates, units = "days"))
+        T <- as.numeric(difftime(T.cal, custs.first.dates, units = "days"))
+        x <- switch(per, day = 1, week = 7, month = 365/12, quarter = 365/4, year = 365)
+        r = r/x
+        T = T/x
+        cbs = cbind(f, r, T)
+        # cbs <- data.frame(f=f, r=r/x, T=T/x)
+        rownames(cbs) <- rownames(cbt)
+        colnames(cbs) <- c("x", "t.x", "T.cal")
+    } else {
+        ## cbt is during holdout period
+        dc.WriteLine("Started making holdout period CBS...")
+        date.begin.holdout.period <- dates[1]
+        date.end.holdout.period <- dates[2]
+        f <- rowSums(cbt)
+        T <- as.numeric(difftime(date.end.holdout.period, date.begin.holdout.period, 
+            units = "days")) + 1
+        x <- switch(per, day = 1, week = 7, month = 365/12, quarter = 365/4, year = 365)
+        T = T/x
+        cbs = cbind(f, T)
+        # cbs <- data.frame( f=f, T=T/x)
+        rownames(cbs) <- rownames(cbt)
+        colnames(cbs) <- c("x.star", "T.star")
+    }
+    
+    dc.WriteLine("Finished building CBS.")
+    return(cbs)
+}
+```
+
+From the calibration period customer-by-time matrix (and a bit of additional information we saved earlier), we can finally create the customer-bysufficient-statistic matrix described earlier. It also requires a time period to use¡ªin this case, we are choosing to use weeks.
+
+```{r}
+birth.periods <- split.data$cust.data$birth.per
+last.dates <- split.data$cust.data$last.date
+cal.cbs.dates <- data.frame(birth.periods, last.dates,end.of.cal.period)
+cal.cbs <- dc.BuildCBSFromCBTAndDates(cal.cbt, cal.cbs.dates,per="week")
+```
+
+##estimate parameters
+
+```{r}
+pnbd.LL <- function(params, x, t.x, T.cal) {
+    
+    h2f1 <- function(a, b, c, z) {
+        lenz <- length(z)
+        j = 0
+        uj <- 1:lenz
+        uj <- uj/uj
+        y <- uj
+        lteps <- 0
+        
+        while (lteps < lenz) {
+            lasty <- y
+            j <- j + 1
+            uj <- uj * (a + j - 1) * (b + j - 1)/(c + j - 1) * z/j
+            y <- y + uj
+            lteps <- sum(y == lasty)
+        }
+        return(y)
+    }
+    
+    max.length <- max(length(x), length(t.x), length(T.cal))
+    
+    if (max.length%%length(x)) 
+        warning("Maximum vector length not a multiple of the length of x")
+    if (max.length%%length(t.x)) 
+        warning("Maximum vector length not a multiple of the length of t.x")
+    if (max.length%%length(T.cal)) 
+        warning("Maximum vector length not a multiple of the length of T.cal")
+    
+    dc.check.model.params(c("r", "alpha", "s", "beta"), params, "pnbd.LL")
+    
+    if (any(x < 0) || !is.numeric(x)) 
+        stop("x must be numeric and may not contain negative numbers.")
+    if (any(t.x < 0) || !is.numeric(t.x)) 
+        stop("t.x must be numeric and may not contain negative numbers.")
+    if (any(T.cal < 0) || !is.numeric(T.cal)) 
+        stop("T.cal must be numeric and may not contain negative numbers.")
+    
+    
+    x <- rep(x, length.out = max.length)
+    t.x <- rep(t.x, length.out = max.length)
+    T.cal <- rep(T.cal, length.out = max.length)
+    
+    r <- params[1]
+    alpha <- params[2]
+    s <- params[3]
+    beta <- params[4]
+    
+    maxab <- max(alpha, beta)
+    absab <- abs(alpha - beta)
+    param2 <- s + 1
+    if (alpha < beta) {
+        param2 <- r + x
+    }
+    part1 <- r * log(alpha) + s * log(beta) - lgamma(r) + lgamma(r + x)
+    part2 <- -(r + x) * log(alpha + T.cal) - s * log(beta + T.cal)
+    if (absab == 0) {
+        partF <- -(r + s + x) * log(maxab + t.x) + log(1 - ((maxab + t.x)/(maxab + 
+            T.cal))^(r + s + x))
+    } else {
+        F1 = h2f1(r + s + x, param2, r + s + x + 1, absab/(maxab + t.x))
+        F2 = h2f1(r + s + x, param2, r + s + x + 1, absab/(maxab + T.cal)) * ((maxab + 
+            t.x)/(maxab + T.cal))^(r + s + x)
+        
+        partF = -(r + s + x) * log(maxab + t.x) + log(F1 - F2)
+        
+        
+    }
+    part3 <- log(s) - log(r + s + x) + partF
+    return(part1 + log(exp(part2) + exp(part3)))
+}
+pnbd.cbs.LL <- function(params, cal.cbs) {
+    
+    dc.check.model.params(c("r", "alpha", "s", "beta"), params, "pnbd.cbs.LL")
+    
+    tryCatch(x <- cal.cbs[, "x"], error = function(e) stop("Error in pnbd.cbs.LL: cal.cbs must have a frequency column labelled \"x\""))
+    tryCatch(t.x <- cal.cbs[, "t.x"], error = function(e) stop("Error in pnbd.cbs.LL: cal.cbs must have a recency column labelled \"t.x\""))
+    tryCatch(T.cal <- cal.cbs[, "T.cal"], error = function(e) stop("Error in pnbd.cbs.LL: cal.cbs must have a column for length of time observed labelled \"T.cal\""))
+    
+    if ("custs" %in% colnames(cal.cbs)) {
+        custs <- cal.cbs[, "custs"]
+    } else {
+        custs <- rep(1, length(x))
+    }
+    return(sum(custs * pnbd.LL(params, x, t.x, T.cal)))
+}
+dc.check.model.params <- function(printnames, params, func) {
+    if (length(params) != length(printnames)) {
+        stop("Error in ", func, ": Incorrect number of parameters; there should be ", 
+            length(printnames), ".", call. = FALSE)
+    }
+    if (!is.numeric(params)) {
+        stop("Error in ", func, ": parameters must be numeric, but are of class ", 
+            class(params), call. = FALSE)
+    }
+    if (any(params < 0)) {
+        stop("Error in ", func, ": All parameters must be positive. Negative parameters: ", 
+            paste(printnames[params < 0], collapse = ", "), call. = FALSE)
+    }
+}
+pnbd.EstimateParameters <- function(cal.cbs, par.start = c(1, 1, 1, 1), max.param.value = 10000) {
+    
+    dc.check.model.params(c("r", "alpha", "s", "beta"), par.start, "pnbd.EstimateParameters")
+    
+    ## helper function to be optimized
+    pnbd.eLL <- function(params, cal.cbs, max.param.value) {
+        params <- exp(params)
+        params[params > max.param.value] <- max.param.value
+        return(-1 * pnbd.cbs.LL(params, cal.cbs))
+    }
+    logparams <- log(par.start)
+    results <- optim(logparams, pnbd.eLL, cal.cbs = cal.cbs, max.param.value = max.param.value, 
+        method = "L-BFGS-B")
+    estimated.params <- exp(results$par)
+    estimated.params[estimated.params > max.param.value] <- max.param.value
+    return(estimated.params)
+}
+params <- pnbd.EstimateParameters(cal.cbs);
+params
+```
+
+As with any optimization, we should not be satisfied with the first output we get. Let¡¯s run it a couple more times, with its own output as a starting point, to see if it converges:
+
+```{r}
+LL <- pnbd.cbs.LL(params, cal.cbs);
+LL
+p.matrix <- c(params, LL);
+for (i in 1:2){
+params <- pnbd.EstimateParameters(cal.cbs, params);
+LL <- pnbd.cbs.LL(params, cal.cbs);
+p.matrix.row <- c(params, LL);
+p.matrix <- rbind(p.matrix, p.matrix.row);
+}
+colnames(p.matrix) <- c("r", "alpha", "s", "beta", "LL");
+rownames(p.matrix) <- 1:3;
+p.matrix
+```
+
+##Individual Level Estimations
+
+we are interested in the number of repeat transactions a newly acquired customer will make in a time period of one year
+
+```{r}
+pnbd.Expectation <- function(params, t) {
+    
+    dc.check.model.params(c("r", "alpha", "s", "beta"), params, "pnbd.Expectation")
+    
+    if (any(t < 0) || !is.numeric(t)) 
+        stop("t must be numeric and may not contain negative numbers.")
+    
+    r = params[1]
+    alpha = params[2]
+    s = params[3]
+    beta = params[4]
+    
+    return((r * beta)/(alpha * (s - 1)) * (1 - (beta/(beta + t))^(s - 1)))
+}
+pnbd.Expectation(params, t=52);
+```
+
+We can also obtain expected characteristics for a specific customer, conditional on their purchasing behavior during the calibration period.
+
+```{r}
+pnbd.ConditionalExpectedTransactions <- function(params, T.star, x, t.x, T.cal) {
+    
+    max.length <- max(length(T.star), length(x), length(t.x), length(T.cal))
+    
+    if (max.length%%length(T.star)) 
+        warning("Maximum vector length not a multiple of the length of T.star")
+    if (max.length%%length(x)) 
+        warning("Maximum vector length not a multiple of the length of x")
+    if (max.length%%length(t.x)) 
+        warning("Maximum vector length not a multiple of the length of t.x")
+    if (max.length%%length(T.cal)) 
+        warning("Maximum vector length not a multiple of the length of T.cal")
+    
+    dc.check.model.params(c("r", "alpha", "s", "beta"), params, "pnbd.ConditionalExpectedTransactions")
+    
+    if (any(T.star < 0) || !is.numeric(T.star)) 
+        stop("T.star must be numeric and may not contain negative numbers.")
+    if (any(x < 0) || !is.numeric(x)) 
+        stop("x must be numeric and may not contain negative numbers.")
+    if (any(t.x < 0) || !is.numeric(t.x)) 
+        stop("t.x must be numeric and may not contain negative numbers.")
+    if (any(T.cal < 0) || !is.numeric(T.cal)) 
+        stop("T.cal must be numeric and may not contain negative numbers.")
+    
+    
+    T.star <- rep(T.star, length.out = max.length)
+    x <- rep(x, length.out = max.length)
+    t.x <- rep(t.x, length.out = max.length)
+    T.cal <- rep(T.cal, length.out = max.length)
+    
+    r <- params[1]
+    alpha <- params[2]
+    s <- params[3]
+    beta <- params[4]
+    
+    P1 <- (r + x) * (beta + T.cal)/((alpha + T.cal) * (s - 1))
+    P2 <- (1 - ((beta + T.cal)/(beta + T.cal + T.star))^(s - 1))
+    P3 <- pnbd.PAlive(params, x, t.x, T.cal)
+    return(P1 * P2 * P3)
+}
+
+pnbd.PAlive <- function(params, x, t.x, T.cal) {
+    
+    h2f1 <- function(a, b, c, z) {
+        lenz <- length(z)
+        j = 0
+        uj <- 1:lenz
+        uj <- uj/uj
+        y <- uj
+        lteps <- 0
+        
+        while (lteps < lenz) {
+            lasty <- y
+            j <- j + 1
+            uj <- uj * (a + j - 1) * (b + j - 1)/(c + j - 1) * z/j
+            y <- y + uj
+            lteps <- sum(y == lasty)
+        }
+        return(y)
+    }
+    
+    max.length <- max(length(x), length(t.x), length(T.cal))
+    
+    if (max.length%%length(x)) 
+        warning("Maximum vector length not a multiple of the length of x")
+    if (max.length%%length(t.x)) 
+        warning("Maximum vector length not a multiple of the length of t.x")
+    if (max.length%%length(T.cal)) 
+        warning("Maximum vector length not a multiple of the length of T.cal")
+    
+    dc.check.model.params(c("r", "alpha", "s", "beta"), params, "pnbd.PAlive")
+    
+    if (any(x < 0) || !is.numeric(x)) 
+        stop("x must be numeric and may not contain negative numbers.")
+    if (any(t.x < 0) || !is.numeric(t.x)) 
+        stop("t.x must be numeric and may not contain negative numbers.")
+    if (any(T.cal < 0) || !is.numeric(T.cal)) 
+        stop("T.cal must be numeric and may not contain negative numbers.")
+    
+    
+    x <- rep(x, length.out = max.length)
+    t.x <- rep(t.x, length.out = max.length)
+    T.cal <- rep(T.cal, length.out = max.length)
+    
+    r <- params[1]
+    alpha <- params[2]
+    s <- params[3]
+    beta <- params[4]
+    
+    A0 <- 0
+    if (alpha >= beta) {
+        F1 <- h2f1(r + s + x, s + 1, r + s + x + 1, (alpha - beta)/(alpha + t.x))
+        F2 <- h2f1(r + s + x, s + 1, r + s + x + 1, (alpha - beta)/(alpha + T.cal))
+        A0 <- F1/((alpha + t.x)^(r + s + x)) - F2/((alpha + T.cal)^(r + s + x))
+    } else {
+        F1 <- h2f1(r + s + x, r + x, r + s + x + 1, (beta - alpha)/(beta + t.x))
+        F2 <- h2f1(r + s + x, r + x, r + s + x + 1, (beta - alpha)/(beta + T.cal))
+        A0 <- F1/((beta + t.x)^(r + s + x)) - F2/((beta + T.cal)^(r + s + x))
+    }
+    
+    
+    
+    
+    return((1 + s/(r + s + x) * (alpha + T.cal)^(r + x) * (beta + T.cal)^s * A0)^(-1))
+}
+```
+
+```{r}
+cal.cbs["1516",]
+x <- cal.cbs["1516", "x"]
+t.x <- cal.cbs["1516", "t.x"]
+T.cal <- cal.cbs["1516", "T.cal"]
+pnbd.ConditionalExpectedTransactions(params, T.star = 52,x, t.x, T.cal)
+pnbd.PAlive(params, x, t.x, T.cal)
+```
+
+##Assess
+
+```{r}
+elog <- dc.SplitUpElogForRepeatTrans(elog)$repeat.trans.elog;
+x.star <- rep(0, nrow(cal.cbs));
+cal.cbs <- cbind(cal.cbs, x.star);
+elog.custs <- elog$cust
+for(i in 1:nrow(cal.cbs)){
+  current.cust <- rownames(cal.cbs)[i]
+  tot.cust.trans<-length(which(elog.custs== current.cust))
+  cal.trans <- cal.cbs[i, "x"]
+  cal.cbs[i, "x.star"] <- tot.cust.trans - cal.trans
+}
+cal.cbs[1:3,]
+```
+
+```{r}
+T.star <- 39 # length of the holdout period
+censor <- 7 # This censor serves the same purpose described above
+x.star <- cal.cbs[,"x.star"]
+comp <- pnbd.PlotFreqVsConditionalExpectedFrequency(params, T.star,
+cal.cbs, x.star, censor)
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+
+
+
+
